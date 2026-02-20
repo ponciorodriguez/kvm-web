@@ -1,33 +1,30 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
-*.egg-info/
-*.egg
+*.so
 .pytest_cache/
 .mypy_cache/
-.venv/
+
+# Virtualenv
 venv/
-
-# Logs / runtime
-logs/
-*.log
-*.pid
-
-# OS / editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
+.venv/
 
 # Env / secrets
 .env
-*.key
-*.pem
-*.crt
+*.env
 
-# Node (si algún día metes frontend build)
-node_modules/
-dist/
+# Logs
+*.log
+logs/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Build / dist
 build/
+dist/
+*.egg-info/
