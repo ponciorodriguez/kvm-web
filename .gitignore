@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Logs / runtime
+logs/
+*.log
+*.pid
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+*.key
+*.pem
+*.crt
+
+# Node (si algún día metes frontend build)
+node_modules/
+dist/
+build/

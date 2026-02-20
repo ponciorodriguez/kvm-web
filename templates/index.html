@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>KVM Web</title>
+
+<style>
+body{
+  font-family: Arial;
+  background:#111;
+  color:#eee;
+  margin:0;
+  display:flex;
+  justify-content:center;
+}
+
+.container{
+  width:100%;
+  max-width:1300px;
+  padding:20px;
+  text-align:center;
+}
+
+h1{ margin:0 0 10px 0; }
+
+.controls{ margin-bottom:10px; }
+
+button{
+  padding:10px 16px;
+  margin:6px;
+  cursor:pointer;
+  font-size:14px;
+}
+
+#status{ margin-top:10px; font-size:16px; }
+#status.on{ color:#00ff88; }
+#status.off{ color:#ff4444; }
+#status.warn{ color:#ffaa00; }
+
+#error{ color:#ff7777; white-space:pre-wrap; margin-top:8px; }
+#hint{ color:#88aaff; margin-top:8px; font-size:13px; }
+
+#wrap{
+  position:relative;
+  margin:16px auto;
+  border:1px solid #333;
+  background:#000;
+  display:inline-block;
+  max-width:100%;
+  max-height:calc(100vh - 240px);
+  overflow:hidden;
+  user-select:none;
+}
+
+#video{
+  display:block;
+  max-width:100%;
+  max-height:calc(100vh - 240px);
+  width:auto;
+  height:auto;
+}
+
+#lockBadge{
+  position:absolute;
+  left:10px;
+  top:10px;
+  background:rgba(0,0,0,0.6);
+  border:1px solid #444;
+  padding:6px 8px;
+  font-size:12px;
+  color:#eee;
+  border-radius:6px;
+  display:none;
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<h1>KVM Web</h1>
+
+<div class="controls">
+  <button id="btnConnect">Conectar Stream</button>
+  <button id="btnRestart">Reiniciar Stream</button>
+  <button id="btnLock">Capturar ratón</button>
+</div>
+
+<div id="status" class="off">Estado: ...</div>
+<div id="error"></div>
+<div id="hint">Capturar ratón activa Pointer Lock. ESC para salir.</div>
+
+<div id="wrap" tabindex="0">
+  <div id="lockBadge">Pointer Lock: ON</div>
+  <img id="video" alt="stream"/>
+</div>
+
+<script>
+
+let lastRunning=false;
+let streamConnected=false;
+let lockOn=false;
+
+const statusEl=document.getElementById("status");
+const errorEl=document.getElementById("error");
+const img=document.getElementById("video");
+const wrap=document.getElementById("wrap");
+const badge=document.getElementById("lockBadge");
+const btnLock=document.getElementById("btnLock");
+
+async function fetchJSON(url,opts={}){
+  const r=await fetch(url,{cache:"no-store",...opts});
+  const t=await r.text();
+  try{return JSON.parse(t);}catch{throw new Error(t.slice(0,300));}
+}
+
+function connectStream(force=false){
+  if(!force && streamConnected && img.src.includes("/stream.mjpg")) return;
+  streamConnected=true;
+  img.src="/stream.mjpg?t="+Date.now();
+}
+
+function disconnectStream(){
+  streamConnected=false;
+  img.src="";
+}
+
+img.addEventListener("error",()=>{
+  if(!lastRunning) return;
+  streamConnected=false;
+  setTimeout(()=>connectStream(true),1000);
+});
+
+async function updateStatus(){
+  try{
+    const d=await fetchJSON("/api/status");
+    const nowRunning=!!d.running;
+
+    statusEl.className=nowRunning?"on":"off";
+    statusEl.textContent=
+      "Estado stream: "+(d.stream || (nowRunning?"ON":"OFF"))+
+      (d.pid?" (pid "+d.pid+")":"");
+
+    errorEl.textContent="";
+
+    if(nowRunning && !lastRunning) connectStream(true);
+    if(!nowRunning && lastRunning) disconnectStream();
+
+    lastRunning=nowRunning;
+  }catch(e){
+    statusEl.className="warn";
+    statusEl.textContent="Estado: ERROR";
+    errorEl.textContent=e.message;
+  }
+}
+
+document.getElementById("btnConnect").onclick=()=>connectStream(true);
+
+document.getElementById("btnRestart").onclick=async()=>{
+  try{
+    await fetchJSON("/api/stream_restart",{method:"POST"});
+    streamConnected=false;
+    connectStream(true);
+  }catch(e){errorEl.textContent=e.message;}
+};
+
+function sendMove(dx,dy){
+  fetch("/api/input/move",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({dx,dy})
+  }).catch(()=>{});
+}
+
+function sendBtn(button,state){
+  fetch("/api/input/button",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({button,state})
+  }).catch(()=>{});
+}
+
+function sendWheel(delta){
+  fetch("/api/input/wheel",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({delta})
+  }).catch(()=>{});
+}
+
+function sendKey(code,state,ev){
+  fetch("/api/input/key",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      code,
+      state,
+      mods:{
+        shift:ev.shiftKey,
+        ctrl:ev.ctrlKey,
+        alt:ev.altKey,
+        meta:ev.metaKey
+      }
+    })
+  }).catch(()=>{});
+}
+
+// ===== Pointer Lock =====
+
+btnLock.onclick=async()=>{
+  try{
+    wrap.focus();
+    await wrap.requestPointerLock();
+  }catch(e){
+    errorEl.textContent="Haz click sobre el vídeo y prueba otra vez.";
+  }
+};
+
+document.addEventListener("pointerlockchange",()=>{
+  const on=(document.pointerLockElement===wrap);
+  lockOn=on;
+  badge.style.display=on?"block":"none";
+  btnLock.textContent=on?"Soltar ratón (ESC)":"Capturar ratón";
+});
+
+// Movimiento relativo real
+let accDX=0,accDY=0,lastSend=0;
+
+document.addEventListener("mousemove",(ev)=>{
+  if(!lastRunning) return;
+  if(document.pointerLockElement!==wrap) return;
+
+  accDX+=ev.movementX;
+  accDY+=ev.movementY;
+
+  const now=Date.now();
+  if(now-lastSend>=16){
+    const dx=Math.round(accDX);
+    const dy=Math.round(accDY);
+    accDX=0;accDY=0;
+    if(dx||dy) sendMove(dx,dy);
+    lastSend=now;
+  }
+});
+
+// Fallback arrastre
+let drag=false,lastX=0,lastY=0;
+
+wrap.addEventListener("mousedown",(ev)=>{
+  if(!lastRunning) return;
+  sendBtn(ev.button,1);
+  if(document.pointerLockElement!==wrap && ev.button===0){
+    drag=true;
+    lastX=ev.clientX;
+    lastY=ev.clientY;
+  }
+});
+
+wrap.addEventListener("mouseup",(ev)=>{
+  if(!lastRunning) return;
+  sendBtn(ev.button,0);
+  drag=false;
+});
+
+wrap.addEventListener("mousemove",(ev)=>{
+  if(!lastRunning) return;
+  if(document.pointerLockElement===wrap) return;
+  if(!drag) return;
+
+  const dx=Math.round(ev.clientX-lastX);
+  const dy=Math.round(ev.clientY-lastY);
+  lastX=ev.clientX;
+  lastY=ev.clientY;
+  if(dx||dy) sendMove(dx,dy);
+});
+
+wrap.addEventListener("wheel",(ev)=>{
+  if(!lastRunning) return;
+  sendWheel(ev.deltaY>0?1:-1);
+  ev.preventDefault();
+},{passive:false});
+
+// ===== Keyboard =====
+
+wrap.addEventListener("keydown",(ev)=>{
+  if(!lastRunning) return;
+  ev.preventDefault();
+  sendKey(ev.code,1,ev);
+});
+
+wrap.addEventListener("keyup",(ev)=>{
+  if(!lastRunning) return;
+  ev.preventDefault();
+  sendKey(ev.code,0,ev);
+});
+
+wrap.addEventListener("click",()=>wrap.focus());
+
+updateStatus();
+setInterval(updateStatus,5000);
+
+</script>
+</div>
+</body>
+</html>
