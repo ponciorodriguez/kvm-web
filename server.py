@@ -30,7 +30,7 @@ app = Flask(__name__)
 # VIDEO CONFIG
 # =============================
 VIDEO_DEV = "/dev/video0"
-VIDEO_SIZE = "1280x1024"
+VIDEO_SIZE = "800x610"
 FPS = "30"
 INPUT_FORMAT = "mjpeg"
 
