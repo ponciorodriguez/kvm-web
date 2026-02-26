@@ -7,7 +7,6 @@ from pathlib import Path
 import threading
 import time
 import queue
-import json
 
 import serial  # pip install pyserial
 
@@ -28,22 +27,15 @@ INPUT_LOG_PATH = LOG_DIR / "input.log"
 app = Flask(__name__)
 
 # =============================
-# VIDEO CONFIG (defaults)
+# VIDEO CONFIG
 # =============================
 VIDEO_DEV = "/dev/video0"
 VIDEO_SIZE = "1280x720"
 FPS = "20"
 INPUT_FORMAT = "mjpeg"
-DEFAULT_QV = 5
-
-# Runtime-editable config file
-VIDEO_CFG_PATH = BASE_DIR / "config" / "video.json"
-_video_cfg_lock = threading.Lock()
-_video_cfg_cache = None
-_video_cfg_mtime = 0.0
 
 # =============================
-# SERIAL CONFIG (CP210x -> /dev/ttyUSB0)
+# SERIAL CONFIG (TU CASO: CP210x -> /dev/ttyUSB0)
 # =============================
 SERIAL_PORT = "/dev/ttyUSB0"
 SERIAL_BAUD = 115200
@@ -71,54 +63,6 @@ def log_input(msg: str):
     except Exception:
         pass
 
-def load_video_cfg():
-    """
-    Lee config de vídeo desde config/video.json con cache por mtime.
-    Devuelve dict: {size, fps, qv, format}
-    """
-    global _video_cfg_cache, _video_cfg_mtime
-
-    defaults = {
-        "size": VIDEO_SIZE,
-        "fps": int(FPS),
-        "qv": int(DEFAULT_QV),
-        "format": INPUT_FORMAT,
-    }
-
-    try:
-        st = VIDEO_CFG_PATH.stat()
-        mtime = st.st_mtime
-    except FileNotFoundError:
-        return defaults
-
-    with _video_cfg_lock:
-        if _video_cfg_cache is not None and mtime == _video_cfg_mtime:
-            return _video_cfg_cache
-
-        try:
-            with open(VIDEO_CFG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f) or {}
-        except Exception as e:
-            log(f"WARN: cannot read {VIDEO_CFG_PATH}: {e}")
-            return defaults
-
-        size = str(cfg.get("size", defaults["size"]))
-        fps = int(cfg.get("fps", defaults["fps"]))
-        qv = int(cfg.get("qv", defaults["qv"]))
-        fmt = str(cfg.get("format", defaults["format"])).lower()
-
-        # sane limits
-        if fps < 5: fps = 5
-        if fps > 60: fps = 60
-        if qv < 2: qv = 2
-        if qv > 15: qv = 15
-        if fmt not in ("mjpeg", "mjpg"):
-            fmt = "mjpeg"
-
-        _video_cfg_cache = {"size": size, "fps": fps, "qv": qv, "format": "mjpeg"}
-        _video_cfg_mtime = mtime
-        return _video_cfg_cache
-
 # =============================
 # STREAM PROCESS
 # =============================
@@ -126,8 +70,6 @@ _ffmpeg_stream_proc = None
 _ffmpeg_lock = threading.Lock()
 
 def _start_stream_proc():
-    cfg = load_video_cfg()
-
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -135,12 +77,12 @@ def _start_stream_proc():
         "-fflags", "nobuffer",
         "-flags", "low_delay",
         "-f", "v4l2",
-        "-input_format", cfg["format"],
-        "-video_size", cfg["size"],
-        "-framerate", str(cfg["fps"]),
+        "-input_format", INPUT_FORMAT,
+        "-video_size", VIDEO_SIZE,
+        "-framerate", FPS,
         "-i", VIDEO_DEV,
         "-f", "mjpeg",
-        "-q:v", str(cfg["qv"]),
+        "-q:v", "5",
         "pipe:1",
     ]
 
@@ -227,15 +169,16 @@ def stream_mjpg():
     )
 
 # =============================
-# SERIAL TX (queue + thread)
+# SERIAL TX (cola + hilo)
 # =============================
 _ser = None
 _ser_lock = threading.Lock()
 _txq: "queue.Queue[bytes]" = queue.Queue(maxsize=8000)
 
+# Estado para watchdog/keepalive
 _state_lock = threading.Lock()
-mouse_btnmask = 0
-any_key_down = False
+mouse_btnmask = 0          # bits: 1 left, 2 right, 4 middle (boot mouse)
+any_key_down = False       # para mantener vivo si tecla pulsada
 
 def _open_serial():
     global _ser
@@ -270,40 +213,82 @@ def _send_line(line: str):
         log("WARN: input queue full, dropping input")
 
 def _keepalive_worker():
+    # Evita que el watchdog de 250ms de la Pico suelte teclas/botones
     while True:
-        time.sleep(0.12)
+        time.sleep(0.12)  # ~8 Hz
         with _state_lock:
             btn = mouse_btnmask
             kd = any_key_down
         if btn != 0 or kd:
             _send_line(f"MD 0 0 0 {btn}")
-
 threading.Thread(target=_keepalive_worker, daemon=True).start()
 
 # =============================
-# HID MAP
+# HID MAP (KeyboardEvent.code -> HID Usage)
+# HID usage IDs (Keyboard/Keypad page)
 # =============================
 HID = {
+    # Letters
     **{f"Key{chr(c)}": 0x04 + (c - ord('A')) for c in range(ord('A'), ord('Z')+1)},
+    # Digits (top row)
     "Digit1": 0x1E, "Digit2": 0x1F, "Digit3": 0x20, "Digit4": 0x21, "Digit5": 0x22,
     "Digit6": 0x23, "Digit7": 0x24, "Digit8": 0x25, "Digit9": 0x26, "Digit0": 0x27,
-    "Enter": 0x28, "Escape": 0x29, "Backspace": 0x2A, "Tab": 0x2B, "Space": 0x2C,
-    "Minus": 0x2D, "Equal": 0x2E, "BracketLeft": 0x2F, "BracketRight": 0x30,
-    "Backslash": 0x31, "Semicolon": 0x33, "Quote": 0x34, "Backquote": 0x35,
-    "Comma": 0x36, "Period": 0x37, "Slash": 0x38,
+
+    # Basic keys
+    "Enter": 0x28,
+    "Escape": 0x29,
+    "Backspace": 0x2A,
+    "Tab": 0x2B,
+    "Space": 0x2C,
+
+    # Symbols
+    "Minus": 0x2D,
+    "Equal": 0x2E,
+    "BracketLeft": 0x2F,
+    "BracketRight": 0x30,
+    "Backslash": 0x31,
+    "Semicolon": 0x33,
+    "Quote": 0x34,
+    "Backquote": 0x35,
+    "Comma": 0x36,
+    "Period": 0x37,
+    "Slash": 0x38,
+
+    # Locks
     "CapsLock": 0x39,
+
+    # Function keys
     "F1": 0x3A, "F2": 0x3B, "F3": 0x3C, "F4": 0x3D, "F5": 0x3E, "F6": 0x3F,
     "F7": 0x40, "F8": 0x41, "F9": 0x42, "F10": 0x43, "F11": 0x44, "F12": 0x45,
-    "PrintScreen": 0x46, "ScrollLock": 0x47, "Pause": 0x48,
-    "Insert": 0x49, "Home": 0x4A, "PageUp": 0x4B, "Delete": 0x4C, "End": 0x4D,
-    "PageDown": 0x4E, "ArrowRight": 0x4F, "ArrowLeft": 0x50, "ArrowDown": 0x51, "ArrowUp": 0x52,
-    "NumpadEnter": 0x58, "NumpadAdd": 0x57, "NumpadSubtract": 0x56, "NumpadMultiply": 0x55,
-    "NumpadDivide": 0x54, "NumpadDecimal": 0x63,
+
+    # Navigation
+    "PrintScreen": 0x46,
+    "ScrollLock": 0x47,
+    "Pause": 0x48,
+    "Insert": 0x49,
+    "Home": 0x4A,
+    "PageUp": 0x4B,
+    "Delete": 0x4C,
+    "End": 0x4D,
+    "PageDown": 0x4E,
+    "ArrowRight": 0x4F,
+    "ArrowLeft": 0x50,
+    "ArrowDown": 0x51,
+    "ArrowUp": 0x52,
+
+    # Keypad (por si lo usas)
+    "NumpadEnter": 0x58,
+    "NumpadAdd": 0x57,
+    "NumpadSubtract": 0x56,
+    "NumpadMultiply": 0x55,
+    "NumpadDivide": 0x54,
+    "NumpadDecimal": 0x63,
     "Numpad0": 0x62, "Numpad1": 0x59, "Numpad2": 0x5A, "Numpad3": 0x5B, "Numpad4": 0x5C,
     "Numpad5": 0x5D, "Numpad6": 0x5E, "Numpad7": 0x5F, "Numpad8": 0x60, "Numpad9": 0x61,
 }
 
 def mods_to_byte(mods: dict) -> int:
+    # Usamos los modificadores "izquierdos" (suficiente)
     m = 0
     if mods.get("ctrl"):  m |= 0x01
     if mods.get("shift"): m |= 0x02
@@ -343,72 +328,11 @@ def api_stream_restart():
     return jsonify(ok=True)
 
 # =============================
-# NEW: RESTART SERVICE + REBOOT
-# =============================
-@app.route("/api/restart_server", methods=["POST"])
-def api_restart_server():
-    try:
-        subprocess.Popen(
-            ["sudo", "/bin/systemctl", "restart", "kvm-web"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
-@app.route("/api/reboot", methods=["POST"])
-def api_reboot():
-    try:
-        subprocess.Popen(
-            ["sudo", "/bin/systemctl", "reboot"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
-# =============================
-# VIDEO CFG API
-# =============================
-@app.route("/api/video_cfg", methods=["GET"])
-def api_video_cfg_get():
-    return jsonify(ok=True, cfg=load_video_cfg())
-
-@app.route("/api/video_cfg", methods=["POST"])
-def api_video_cfg_set():
-    d = request.get_json(force=True, silent=True) or {}
-
-    size = str(d.get("size", "1280x720"))
-    fps = int(d.get("fps", 20))
-    qv = int(d.get("qv", 5))
-    fmt = str(d.get("format", "mjpeg")).lower()
-
-    allowed_sizes = {
-        "1920x1080", "2560x1440", "1360x768",
-        "1280x1024", "1280x960", "1280x720",
-        "1024x768", "800x600",
-        "720x576", "720x480", "640x480"
-    }
-    if size not in allowed_sizes:
-        return jsonify(ok=False, error="size not allowed"), 400
-    if not (5 <= fps <= 60):
-        return jsonify(ok=False, error="fps out of range"), 400
-    if not (2 <= qv <= 15):
-        return jsonify(ok=False, error="qv out of range"), 400
-    if fmt not in ("mjpeg", "mjpg"):
-        return jsonify(ok=False, error="format not allowed"), 400
-
-    VIDEO_CFG_PATH.parent.mkdir(exist_ok=True)
-    with open(VIDEO_CFG_PATH, "w", encoding="utf-8") as f:
-        json.dump({"size": size, "fps": fps, "qv": qv, "format": "mjpeg"}, f, indent=2)
-
-    return api_stream_restart()
-
-# =============================
 # INPUT API -> TU PROTOCOLO (MD/KD/KU/CL)
 # =============================
+
+# Browser button -> boot mouse bits
+# browser: 0 left, 1 middle, 2 right
 BTN_MAP = {0: 0x01, 1: 0x04, 2: 0x02}
 
 @app.route("/api/input/move", methods=["POST"])
@@ -440,6 +364,7 @@ def api_input_button():
             mouse_btnmask &= (~bit) & 0x07
         btn = mouse_btnmask
 
+    # Enviamos un MD “cero” solo para actualizar botones
     _send_line(f"MD 0 0 0 {btn}")
     log_input(f"MD 0 0 0 {btn} (btn event b={button} s={state})")
     return jsonify(ok=True)
@@ -447,7 +372,7 @@ def api_input_button():
 @app.route("/api/input/wheel", methods=["POST"])
 def api_input_wheel():
     d = request.get_json(force=True, silent=True) or {}
-    delta = int(d.get("delta", 0))
+    delta = int(d.get("delta", 0))  # +1/-1
 
     with _state_lock:
         btn = mouse_btnmask
@@ -467,6 +392,7 @@ def api_input_key():
     hid = HID.get(code, 0)
     modb = mods_to_byte(mods)
 
+    # Si no reconocemos la tecla, ignoramos
     if hid == 0:
         log_input(f"KEY UNKNOWN {code} state={state} mods={mods}")
         return jsonify(ok=True)
@@ -479,6 +405,7 @@ def api_input_key():
     else:
         with _state_lock:
             any_key_down = False
+        # Tu parser exige 3 tokens siempre:
         _send_line("KU 00 00")
         log_input(f"KU 00 00 ({code})")
 

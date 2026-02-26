@@ -33,6 +33,12 @@ button{
   font-size:14px;
 }
 
+select{
+  padding:8px 10px;
+  margin:6px;
+  font-size:14px;
+}
+
 #status{ margin-top:10px; font-size:16px; }
 #status.on{ color:#00ff88; }
 #status.off{ color:#ff4444; }
@@ -46,19 +52,24 @@ button{
   margin:16px auto;
   border:1px solid #333;
   background:#000;
-  display:inline-block;
+
+  /* clave: define un área con altura real */
+  width:100%;
   max-width:100%;
+  height:calc(100vh - 240px);
   max-height:calc(100vh - 240px);
+
   overflow:hidden;
   user-select:none;
 }
 
+/* clave: ocupar el contenedor y mantener proporción */
 #video{
   display:block;
-  max-width:100%;
-  max-height:calc(100vh - 240px);
-  width:auto;
-  height:auto;
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  background:#000;
 }
 
 #lockBadge{
@@ -85,6 +96,28 @@ button{
   <button id="btnConnect">Conectar Stream</button>
   <button id="btnRestart">Reiniciar Stream</button>
   <button id="btnLock">Capturar ratón</button>
+
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+
+  <label style="font-size:14px;">
+    Resolución:
+    <select id="selRes">
+      <option value="1280x720">1280x720 (baja latencia)</option>
+      <option value="1920x1080">1920x1080</option>
+      <option value="1024x768">1024x768</option>
+      <option value="1280x1024">1280x1024</option>
+      <option value="800x600">800x600</option>
+    </select>
+  </label>
+
+  <button id="btnApplyRes">Aplicar</button>
+<button id="btnRestartServer" style="background:#aa3333;color:white;">
+  Reiniciar Servidor
+</button>
+<button id="btnReboot" style="background:#cc0000;color:white;">
+  Reiniciar PC (Reboot)
+</button>
+
 </div>
 
 <div id="status" class="off">Estado: ...</div>
@@ -97,7 +130,6 @@ button{
 </div>
 
 <script>
-
 let lastRunning=false;
 let streamConnected=false;
 let lockOn=false;
@@ -108,6 +140,9 @@ const img=document.getElementById("video");
 const wrap=document.getElementById("wrap");
 const badge=document.getElementById("lockBadge");
 const btnLock=document.getElementById("btnLock");
+
+const selRes=document.getElementById("selRes");
+const btnApplyRes=document.getElementById("btnApplyRes");
 
 async function fetchJSON(url,opts={}){
   const r=await fetch(url,{cache:"no-store",...opts});
@@ -155,6 +190,18 @@ async function updateStatus(){
   }
 }
 
+async function loadVideoCfgToUI(){
+  try{
+    const d=await fetchJSON("/api/video_cfg");
+    if(d && d.cfg && d.cfg.size){
+      selRes.value = d.cfg.size;
+    }
+  }catch(e){
+    // no bloqueamos la app si falla, pero informamos
+    errorEl.textContent=e.message;
+  }
+}
+
 document.getElementById("btnConnect").onclick=()=>connectStream(true);
 
 document.getElementById("btnRestart").onclick=async()=>{
@@ -163,6 +210,25 @@ document.getElementById("btnRestart").onclick=async()=>{
     streamConnected=false;
     connectStream(true);
   }catch(e){errorEl.textContent=e.message;}
+};
+
+btnApplyRes.onclick=async()=>{
+  try{
+    const size = selRes.value;
+
+    // mantenemos tus valores estables: fps 20, qv 5
+    await fetchJSON("/api/video_cfg",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({size, fps:20, qv:5, format:"mjpeg"})
+    });
+
+    // reconectar stream tras el restart
+    streamConnected=false;
+    connectStream(true);
+  }catch(e){
+    errorEl.textContent=e.message;
+  }
 };
 
 function sendMove(dx,dy){
@@ -297,8 +363,37 @@ wrap.addEventListener("keyup",(ev)=>{
 
 wrap.addEventListener("click",()=>wrap.focus());
 
+// init
+loadVideoCfgToUI();
 updateStatus();
 setInterval(updateStatus,5000);
+document.getElementById("btnRestartServer").onclick=async()=>{
+  if(!confirm("¿Seguro que quieres reiniciar el servidor KVM?"))
+    return;
+
+  try{
+    statusEl.textContent="Reiniciando servidor...";
+    await fetch("/api/restart_server",{method:"POST"});
+    setTimeout(()=>location.reload(),3000);
+  }catch(e){
+    errorEl.textContent=e.message;
+  }
+};
+
+document.getElementById("btnReboot").onclick = async () => {
+  if(!confirm("⚠️ Esto reinicia el miniPC. ¿Seguro?")) return;
+
+  try{
+    statusEl.className="warn";
+    statusEl.textContent="Reiniciando PC...";
+    await fetch("/api/reboot", { method:"POST" });
+
+    // La web caerá. Espera y recarga por si vuelve rápido.
+    setTimeout(()=>location.reload(), 20000);
+  }catch(e){
+    errorEl.textContent = e.message;
+  }
+};
 
 </script>
 </div>
