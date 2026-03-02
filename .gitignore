@@ -19,6 +19,11 @@ venv/
 *.log
 logs/
 
+# Runtime config
+config/video.json
+*.pid
+*.fifo
+
 # OS / Editor
 .DS_Store
 .vscode/

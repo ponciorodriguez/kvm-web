@@ -32,12 +32,20 @@ app = Flask(__name__)
 # =============================
 VIDEO_DEV = "/dev/video0"
 VIDEO_SIZE = "1280x720"
-FPS = "20"
+FPS = "12"
 INPUT_FORMAT = "mjpeg"
 DEFAULT_QV = 5
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# HARD LOCK: FPS FIJO SIEMPRE
+# Pon None si algún día quieres permitir cambios
+LOCK_FPS = 12
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
 # Runtime-editable config file
 VIDEO_CFG_PATH = BASE_DIR / "config" / "video.json"
+VIDEO_CFG_PATH.parent.mkdir(exist_ok=True)
+
 _video_cfg_lock = threading.Lock()
 _video_cfg_cache = None
 _video_cfg_mtime = 0.0
@@ -71,6 +79,31 @@ def log_input(msg: str):
     except Exception:
         pass
 
+def invalidate_video_cfg_cache():
+    global _video_cfg_cache, _video_cfg_mtime
+    with _video_cfg_lock:
+        _video_cfg_cache = None
+        _video_cfg_mtime = 0.0
+
+def _sanitize_cfg(size: str, fps: int, qv: int, fmt: str):
+    # sane limits
+    if fps < 5: fps = 5
+    if fps > 60: fps = 60
+    if qv < 2: qv = 2
+    if qv > 15: qv = 15
+    fmt = (fmt or "mjpeg").lower()
+    if fmt not in ("mjpeg", "mjpg"):
+        fmt = "mjpeg"
+    # FPS lock
+    if LOCK_FPS is not None:
+        fps = int(LOCK_FPS)
+    return size, fps, qv, "mjpeg"
+
+def _write_video_cfg(size: str, fps: int, qv: int, fmt: str = "mjpeg"):
+    VIDEO_CFG_PATH.parent.mkdir(exist_ok=True)
+    with open(VIDEO_CFG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"size": size, "fps": fps, "qv": qv, "format": "mjpeg"}, f, indent=2)
+
 def load_video_cfg():
     """
     Lee config de vídeo desde config/video.json con cache por mtime.
@@ -85,11 +118,17 @@ def load_video_cfg():
         "format": INPUT_FORMAT,
     }
 
+    # Si hay LOCK_FPS, que el default también lo respete
+    if LOCK_FPS is not None:
+        defaults["fps"] = int(LOCK_FPS)
+
     try:
         st = VIDEO_CFG_PATH.stat()
         mtime = st.st_mtime
     except FileNotFoundError:
-        return defaults
+        # no existe config aún
+        size, fps, qv, fmt = _sanitize_cfg(defaults["size"], defaults["fps"], defaults["qv"], defaults["format"])
+        return {"size": size, "fps": fps, "qv": qv, "format": fmt}
 
     with _video_cfg_lock:
         if _video_cfg_cache is not None and mtime == _video_cfg_mtime:
@@ -100,32 +139,122 @@ def load_video_cfg():
                 cfg = json.load(f) or {}
         except Exception as e:
             log(f"WARN: cannot read {VIDEO_CFG_PATH}: {e}")
-            return defaults
+            size, fps, qv, fmt = _sanitize_cfg(defaults["size"], defaults["fps"], defaults["qv"], defaults["format"])
+            return {"size": size, "fps": fps, "qv": qv, "format": fmt}
 
         size = str(cfg.get("size", defaults["size"]))
         fps = int(cfg.get("fps", defaults["fps"]))
         qv = int(cfg.get("qv", defaults["qv"]))
         fmt = str(cfg.get("format", defaults["format"])).lower()
 
-        # sane limits
-        if fps < 5: fps = 5
-        if fps > 60: fps = 60
-        if qv < 2: qv = 2
-        if qv > 15: qv = 15
-        if fmt not in ("mjpeg", "mjpg"):
-            fmt = "mjpeg"
+        size, fps, qv, fmt = _sanitize_cfg(size, fps, qv, fmt)
 
-        _video_cfg_cache = {"size": size, "fps": fps, "qv": qv, "format": "mjpeg"}
+        # Si el JSON tenía otro fps y hay LOCK_FPS, lo corregimos en disco (una sola vez)
+        if LOCK_FPS is not None:
+            try:
+                if int(cfg.get("fps", -1)) != int(LOCK_FPS):
+                    log(f"INFO: forcing fps to {LOCK_FPS} (was {cfg.get('fps')}); rewriting {VIDEO_CFG_PATH}")
+                    _write_video_cfg(size, fps, qv, fmt)
+                    # refrescar mtime
+                    mtime = VIDEO_CFG_PATH.stat().st_mtime
+            except Exception as e:
+                log(f"WARN: cannot rewrite locked fps cfg: {e}")
+
+        _video_cfg_cache = {"size": size, "fps": fps, "qv": qv, "format": fmt}
         _video_cfg_mtime = mtime
         return _video_cfg_cache
 
+
 # =============================
-# STREAM PROCESS
+# STREAM PROCESS + BROADCASTER
 # =============================
 _ffmpeg_stream_proc = None
+_ffmpeg_errf = None
 _ffmpeg_lock = threading.Lock()
 
-def _start_stream_proc():
+class FrameHub:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._frame = None
+        self._seq = 0
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            self._thread = threading.Thread(target=self._worker, daemon=True)
+            self._thread.start()
+
+    def update_frame(self, jpg: bytes):
+        with self._lock:
+            self._frame = jpg
+            self._seq += 1
+            self._cond.notify_all()
+
+    def get_next(self, last_seq: int, timeout: float = 2.0):
+        with self._lock:
+            if not self._running:
+                return None, last_seq
+            end = time.time() + timeout
+            while self._seq == last_seq and self._running:
+                remaining = end - time.time()
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=remaining)
+            return self._frame, self._seq
+
+    def _worker(self):
+        backoff = 0.5
+        buf = b""
+        while True:
+            with self._lock:
+                if not self._running:
+                    return
+
+            proc = ensure_stream_proc()
+            if not proc or not proc.stdout:
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 3.0)
+                continue
+
+            backoff = 0.5
+            try:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    time.sleep(0.01)
+                    continue
+                buf += chunk
+
+                while True:
+                    soi = buf.find(b"\xff\xd8")
+                    if soi < 0:
+                        if len(buf) > 2_000_000:
+                            buf = buf[-500_000:]
+                        break
+                    eoi = buf.find(b"\xff\xd9", soi)
+                    if eoi < 0:
+                        if soi > 0:
+                            buf = buf[soi:]
+                        break
+
+                    jpg = buf[soi:eoi+2]
+                    buf = buf[eoi+2:]
+                    self.update_frame(jpg)
+
+            except Exception as e:
+                log(f"WARN: frame worker read error: {e}")
+                stream_restart_internal()
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 3.0)
+
+framehub = FrameHub()
+framehub.start()
+
+def start_stream_proc():
     cfg = load_video_cfg()
 
     cmd = [
@@ -144,30 +273,59 @@ def _start_stream_proc():
         "pipe:1",
     ]
 
-    errf = open(FFMPEG_STREAM_ERR, "ab", buffering=0)
+    global _ffmpeg_errf
+    _ffmpeg_errf = open(FFMPEG_STREAM_ERR, "ab", buffering=0)
     log(f"Starting stream ffmpeg: {' '.join(cmd)}")
 
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=errf,
+        stderr=_ffmpeg_errf,
         bufsize=0,
         start_new_session=True
     )
     return proc
 
-def _ensure_stream_proc():
+def stop_stream_proc(proc):
+    if not proc:
+        return
+    try:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                pass
+            for _ in range(20):
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+def ensure_stream_proc():
     global _ffmpeg_stream_proc
     with _ffmpeg_lock:
         if _ffmpeg_stream_proc and _ffmpeg_stream_proc.poll() is None:
             return _ffmpeg_stream_proc
 
-        _ffmpeg_stream_proc = None
-        proc = _start_stream_proc()
+        if _ffmpeg_stream_proc:
+            stop_stream_proc(_ffmpeg_stream_proc)
+            _ffmpeg_stream_proc = None
 
-        time.sleep(0.4)
+        proc = start_stream_proc()
+        time.sleep(0.25)
         if proc.poll() is not None:
             log("ERROR: stream ffmpeg died at start (see logs/ffmpeg_stream.stderr.log)")
+            stop_stream_proc(proc)
             _ffmpeg_stream_proc = None
             return None
 
@@ -175,50 +333,35 @@ def _ensure_stream_proc():
         log(f"stream ffmpeg running pid={proc.pid}")
         return _ffmpeg_stream_proc
 
-def _stream_generator():
-    proc = _ensure_stream_proc()
-    if not proc or not proc.stdout:
-        return
+def stream_restart_internal():
+    global _ffmpeg_stream_proc
+    with _ffmpeg_lock:
+        p = _ffmpeg_stream_proc
+        _ffmpeg_stream_proc = None
+    if p:
+        stop_stream_proc(p)
+
+@app.route("/stream.mjpg")
+def stream_mjpg():
+    proc = ensure_stream_proc()
+    if not proc:
+        return "STREAM OFF\n", 503
 
     boundary = b"--frame\r\n"
     header = b"Content-Type: image/jpeg\r\n\r\n"
 
-    buf = b""
-    while True:
-        if proc.poll() is not None:
-            break
-
-        chunk = proc.stdout.read(4096)
-        if not chunk:
-            continue
-
-        buf += chunk
-
+    def gen():
+        last = 0
         while True:
-            soi = buf.find(b"\xff\xd8")
-            if soi < 0:
-                if len(buf) > 2_000_000:
-                    buf = buf[-500_000:]
-                break
-
-            eoi = buf.find(b"\xff\xd9", soi)
-            if eoi < 0:
-                if soi > 0:
-                    buf = buf[soi:]
-                break
-
-            jpg = buf[soi:eoi+2]
-            buf = buf[eoi+2:]
-            yield boundary + header + jpg + b"\r\n"
-
-@app.route("/stream.mjpg")
-def stream_mjpg():
-    proc = _ensure_stream_proc()
-    if not proc:
-        return "STREAM OFF\n", 503
+            jpg, seq = framehub.get_next(last, timeout=2.0)
+            last = seq
+            if jpg:
+                yield boundary + header + jpg + b"\r\n"
+            else:
+                yield boundary + b"Content-Type: text/plain\r\n\r\n\r\n"
 
     return Response(
-        stream_with_context(_stream_generator()),
+        stream_with_context(gen()),
         mimetype="multipart/x-mixed-replace; boundary=frame",
         headers={
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -327,48 +470,50 @@ def api_status():
         p = _ffmpeg_stream_proc
     running = bool(p and p.poll() is None)
     pid = p.pid if running else None
-    return jsonify(ok=True, running=running, pid=pid, stream="ON" if running else "OFF")
+    cfg = load_video_cfg()
+    return jsonify(ok=True, running=running, pid=pid, stream="ON" if running else "OFF", cfg=cfg)
 
 @app.route("/api/stream_restart", methods=["POST"])
 def api_stream_restart():
-    global _ffmpeg_stream_proc
-    with _ffmpeg_lock:
-        p = _ffmpeg_stream_proc
-        _ffmpeg_stream_proc = None
-    if p and p.poll() is None:
-        try:
-            os.killpg(p.pid, signal.SIGTERM)
-        except Exception:
-            pass
+    stream_restart_internal()
+    invalidate_video_cfg_cache()
     return jsonify(ok=True)
-
-# =============================
-# NEW: RESTART SERVICE + REBOOT
-# =============================
 @app.route("/api/restart_server", methods=["POST"])
 def api_restart_server():
     try:
-        subprocess.Popen(
-            ["sudo", "/bin/systemctl", "restart", "kvm-web"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+        r = subprocess.run(
+            ["sudo", "-n", "/bin/systemctl", "restart", "kvm-web"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
         )
+        if r.returncode != 0:
+            log(f"ERROR restart kvm-web failed rc={r.returncode} stderr={r.stderr.strip()} stdout={r.stdout.strip()}")
+            return jsonify(ok=False, error="restart failed", rc=r.returncode, stderr=r.stderr, stdout=r.stdout), 500
+        log("INFO restart kvm-web accepted")
         return jsonify(ok=True)
     except Exception as e:
+        log(f"ERROR restart exception: {e}")
         return jsonify(ok=False, error=str(e)), 500
+
 
 @app.route("/api/reboot", methods=["POST"])
 def api_reboot():
     try:
-        subprocess.Popen(
-            ["sudo", "/bin/systemctl", "reboot"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+        r = subprocess.run(
+            ["sudo", "-n", "/bin/systemctl", "reboot"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
         )
+        if r.returncode != 0:
+            log(f"ERROR reboot failed rc={r.returncode} stderr={r.stderr.strip()} stdout={r.stdout.strip()}")
+            return jsonify(ok=False, error="reboot failed", rc=r.returncode, stderr=r.returncode, stdout=r.stdout), 500
+        log("INFO reboot accepted")
         return jsonify(ok=True)
     except Exception as e:
+        log(f"ERROR reboot exception: {e}")
         return jsonify(ok=False, error=str(e)), 500
-
 # =============================
 # VIDEO CFG API
 # =============================
@@ -379,11 +524,7 @@ def api_video_cfg_get():
 @app.route("/api/video_cfg", methods=["POST"])
 def api_video_cfg_set():
     d = request.get_json(force=True, silent=True) or {}
-
-    size = str(d.get("size", "1280x720"))
-    fps = int(d.get("fps", 20))
-    qv = int(d.get("qv", 5))
-    fmt = str(d.get("format", "mjpeg")).lower()
+    current = load_video_cfg()
 
     allowed_sizes = {
         "1920x1080", "2560x1440", "1360x768",
@@ -391,20 +532,27 @@ def api_video_cfg_set():
         "1024x768", "800x600",
         "720x576", "720x480", "640x480"
     }
+
+    size = str(d.get("size", current["size"]))
+    qv   = int(d.get("qv", current["qv"]))
+    fmt  = str(d.get("format", current["format"])).lower()
+
     if size not in allowed_sizes:
         return jsonify(ok=False, error="size not allowed"), 400
-    if not (5 <= fps <= 60):
-        return jsonify(ok=False, error="fps out of range"), 400
     if not (2 <= qv <= 15):
         return jsonify(ok=False, error="qv out of range"), 400
     if fmt not in ("mjpeg", "mjpg"):
         return jsonify(ok=False, error="format not allowed"), 400
 
-    VIDEO_CFG_PATH.parent.mkdir(exist_ok=True)
-    with open(VIDEO_CFG_PATH, "w", encoding="utf-8") as f:
-        json.dump({"size": size, "fps": fps, "qv": qv, "format": "mjpeg"}, f, indent=2)
+    # FPS SIEMPRE BLOQUEADO
+    fps = int(LOCK_FPS) if LOCK_FPS is not None else current["fps"]
 
-    return api_stream_restart()
+    _write_video_cfg(size, fps, qv, "mjpeg")
+    invalidate_video_cfg_cache()
+    stream_restart_internal()
+
+    log(f"/api/video_cfg POST: {d} -> SAVED size={size} fps={fps} qv={qv}")
+    return jsonify(ok=True, cfg=load_video_cfg())
 
 # =============================
 # INPUT API -> TU PROTOCOLO (MD/KD/KU/CL)
@@ -498,5 +646,19 @@ def api_input_clear():
 # MAIN
 # =============================
 if __name__ == "__main__":
-    print("Starting KVM Web Server...")
+    log("Starting KVM Web Server...")
+
+    # crea/corrige config por defecto (útil para clonados) con FPS bloqueado
+    try:
+        if not VIDEO_CFG_PATH.exists():
+            _write_video_cfg(VIDEO_SIZE, int(LOCK_FPS) if LOCK_FPS is not None else int(FPS), int(DEFAULT_QV), "mjpeg")
+        else:
+            # si existe y hay LOCK_FPS, lo normalizamos
+            cfg = load_video_cfg()
+            if LOCK_FPS is not None:
+                _write_video_cfg(cfg["size"], int(LOCK_FPS), cfg["qv"], "mjpeg")
+                invalidate_video_cfg_cache()
+    except Exception as e:
+        log(f"WARN: cannot init video cfg: {e}")
+
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)

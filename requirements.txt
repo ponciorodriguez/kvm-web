@@ -1,4 +1,2 @@
-Flask
-pyserial
-evdev
-gunicorn
+Flask>=3.1
+pyserial>=3.5
