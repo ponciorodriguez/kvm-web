@@ -15,6 +15,12 @@ venv/
 .env
 *.env
 
+# Cloudflare
+*.token
+cloudflared.token
+*.json
+.cloudflared/
+
 # Logs
 *.log
 logs/
@@ -28,6 +34,13 @@ config/video.json
 .DS_Store
 .vscode/
 .idea/
+
+# SSH
+.ssh/
+
+# System
+*.swp
+*~
 
 # Build / dist
 build/
